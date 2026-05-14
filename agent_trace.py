@@ -1,582 +1,532 @@
 #!/usr/bin/env python3
 """
-agent-trace — Trace and debug AI agent decisions
-Think Chrome DevTools for AI agents.
+agent-trace — Lightweight observability CLI for AI agents.
+
+Trace decisions, tool calls, costs, and failures across any AI agent framework.
+Think "Chrome DevTools for AI agents."
+
+Usage:
+    agent-trace init                    # Initialize tracing session
+    agent-trace log <agent> <event>     # Log an agent event
+    agent-trace show                    # Show current session trace
+    agent-trace summary                 # Show session summary
+    agent-trace export <format>         # Export trace (json|csv|html)
+    agent-trace sessions                # List all sessions
+    agent-trace watch                   # Watch live agent activity
 """
 
-import sqlite3
+import argparse
 import json
-import time
-import hashlib
-import sys
+import csv
 import os
-from datetime import datetime, timedelta
+import sys
+import time
+import uuid
+import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
 
-# ── Configuration ──────────────────────────────────────────────────────────
+TRACE_DIR = Path.home() / ".agent-trace"
+SESSION_FILE = TRACE_DIR / "current_session.json"
+SESSIONS_DIR = TRACE_DIR / "sessions"
 
-DB_PATH = Path.home() / ".agent-trace" / "traces.db"
+# ─── ANSI Colors ───────────────────────────────────────────────────────────────
 
-# ── Database ──────────────────────────────────────────────────────────────
+class C:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN = "\033[96m"
+    GRAY = "\033[90m"
 
-def init_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
-    
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS traces (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            trace_id TEXT NOT NULL,
-            agent TEXT NOT NULL,
-            session_id TEXT,
-            timestamp TEXT NOT NULL,
-            step_number INTEGER NOT NULL,
-            step_type TEXT NOT NULL,
-            input_text TEXT,
-            output_text TEXT,
-            tool_name TEXT,
-            tool_args TEXT,
-            tool_result TEXT,
-            reasoning TEXT,
-            duration_ms REAL,
-            tokens_input INTEGER,
-            tokens_output INTEGER,
-            model TEXT,
-            metadata TEXT DEFAULT '{}'
-        )
-    """)
-    
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT UNIQUE NOT NULL,
-            agent TEXT NOT NULL,
-            started_at TEXT NOT NULL,
-            ended_at TEXT,
-            total_steps INTEGER DEFAULT 0,
-            total_duration_ms REAL DEFAULT 0,
-            total_tokens_input INTEGER DEFAULT 0,
-            total_tokens_output INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'active',
-            summary TEXT DEFAULT ''
-        )
-    """)
-    
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_traces_session ON traces(session_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_traces_agent ON traces(agent)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_traces_timestamp ON traces(timestamp)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_traces_step_type ON traces(step_type)")
-    
-    conn.commit()
-    return conn
+def colored(text, color):
+    return f"{color}{text}{C.RESET}"
 
-def get_conn():
-    return sqlite3.connect(str(DB_PATH))
+# ─── Helpers ───────────────────────────────────────────────────────────────────
 
-# ── Trace Session ─────────────────────────────────────────────────────────
+def ensure_dirs():
+    TRACE_DIR.mkdir(parents=True, exist_ok=True)
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
-class TraceSession:
-    """Context manager for tracing agent sessions."""
-    
-    def __init__(self, agent: str, session_id: str = None):
-        self.agent = agent
-        self.session_id = session_id or self._generate_id()
-        self.step = 0
-        self.started_at = datetime.now()
-        self.conn = get_conn()
-        
-        self.conn.execute("""
-            INSERT OR REPLACE INTO sessions (session_id, agent, started_at, status)
-            VALUES (?, ?, ?, 'active')
-        """, (self.session_id, self.agent, self.started_at.isoformat()))
-        self.conn.commit()
-    
-    def _generate_id(self) -> str:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        h = hashlib.md5(f"{self.agent}{time.time()}".encode()).hexdigest()[:8]
-        return f"{self.agent}_{ts}_{h}"
-    
-    def log_step(self, step_type: str, input_text: str = None, output_text: str = None,
-                 tool_name: str = None, tool_args: dict = None, tool_result: str = None,
-                 reasoning: str = None, duration_ms: float = None,
-                 tokens_input: int = None, tokens_output: int = None,
-                 model: str = None, metadata: dict = None):
-        """Log a single step in the trace."""
-        self.step += 1
-        
-        self.conn.execute("""
-            INSERT INTO traces (trace_id, agent, session_id, timestamp, step_number, step_type,
-                input_text, output_text, tool_name, tool_args, tool_result, reasoning,
-                duration_ms, tokens_input, tokens_output, model, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            self.session_id, self.agent, self.session_id,
-            datetime.now().isoformat(), self.step, step_type,
-            input_text, output_text, tool_name,
-            json.dumps(tool_args) if tool_args else None,
-            tool_result, reasoning, duration_ms,
-            tokens_input, tokens_output, model,
-            json.dumps(metadata or {})
-        ))
-        self.conn.commit()
-    
-    def log_llm_call(self, input_text: str, output_text: str, reasoning: str = None,
-                     duration_ms: float = None, tokens_input: int = None,
-                     tokens_output: int = None, model: str = None):
-        """Log an LLM call."""
-        self.log_step("llm_call", input_text=input_text, output_text=output_text,
-                     reasoning=reasoning, duration_ms=duration_ms,
-                     tokens_input=tokens_input, tokens_output=tokens_output, model=model)
-    
-    def log_tool_call(self, tool_name: str, tool_args: dict, tool_result: str,
-                      duration_ms: float = None):
-        """Log a tool call."""
-        self.log_step("tool_call", tool_name=tool_name, tool_args=tool_args,
-                     tool_result=tool_result, duration_ms=duration_ms)
-    
-    def log_decision(self, reasoning: str, decision: str, context: str = None):
-        """Log a decision point."""
-        self.log_step("decision", input_text=context, output_text=decision,
-                     reasoning=reasoning)
-    
-    def log_error(self, error: str, context: str = None):
-        """Log an error."""
-        self.log_step("error", input_text=context, output_text=error)
-    
-    def end(self, summary: str = None):
-        """End the trace session."""
-        ended_at = datetime.now()
-        duration = (ended_at - self.started_at).total_seconds() * 1000
-        
-        totals = self.conn.execute("""
-            SELECT COUNT(*), SUM(tokens_input), SUM(tokens_output)
-            FROM traces WHERE session_id = ?
-        """, (self.session_id,)).fetchone()
-        
-        self.conn.execute("""
-            UPDATE sessions SET
-                ended_at = ?, total_steps = ?, total_duration_ms = ?,
-                total_tokens_input = ?, total_tokens_output = ?,
-                status = 'completed', summary = ?
-            WHERE session_id = ?
-        """, (
-            ended_at.isoformat(), totals[0] or 0, duration,
-            totals[1] or 0, totals[2] or 0,
-            summary or "", self.session_id
-        ))
-        self.conn.commit()
-        self.conn.close()
-    
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, *args):
-        self.end()
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
-# ── Query & Analysis ──────────────────────────────────────────────────────
+def duration_str(start, end):
+    if not start or not end:
+        return "N/A"
+    try:
+        s = datetime.fromisoformat(start)
+        e = datetime.fromisoformat(end)
+        d = (e - s).total_seconds()
+        if d < 60:
+            return f"{d:.1f}s"
+        elif d < 3600:
+            return f"{d/60:.1f}m"
+        else:
+            return f"{d/3600:.1f}h"
+    except Exception:
+        return "N/A"
 
-def get_session(session_id: str) -> dict:
-    """Get session details."""
-    conn = get_conn()
-    
-    session = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
-    if not session:
-        conn.close()
-        return None
-    
-    steps = conn.execute("""
-        SELECT step_number, step_type, input_text, output_text, tool_name,
-               reasoning, duration_ms, tokens_input, tokens_output, model, timestamp
-        FROM traces WHERE session_id = ? ORDER BY step_number
-    """, (session_id,)).fetchall()
-    
-    conn.close()
-    
-    return {
-        "session_id": session[1],
-        "agent": session[2],
-        "started_at": session[3],
-        "ended_at": session[4],
-        "total_steps": session[5],
-        "total_duration_ms": session[6],
-        "total_tokens_input": session[7],
-        "total_tokens_output": session[8],
-        "status": session[9],
-        "summary": session[10],
-        "steps": [{
-            "step": s[0], "type": s[1], "input": s[2], "output": s[3],
-            "tool": s[4], "reasoning": s[5], "duration_ms": s[6],
-            "tokens_in": s[7], "tokens_out": s[8], "model": s[9],
-            "timestamp": s[10]
-        } for s in steps]
+def load_session(path):
+    if path.exists():
+        with open(path) as f:
+            return json.load(f)
+    return None
+
+def save_session(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+
+def event_icon(event_type):
+    icons = {
+        "decision": "🧠",
+        "tool_call": "🔧",
+        "tool_result": "✅",
+        "error": "❌",
+        "warning": "⚠️",
+        "cost": "💰",
+        "start": "🚀",
+        "end": "🏁",
+        "info": "ℹ️",
+        "llm_call": "🤖",
+        "llm_response": "💬",
+        "memory_read": "📖",
+        "memory_write": "✍️",
+        "user_input": "👤",
+        "agent_spawn": "🐣",
+        "agent_join": "🔗",
     }
+    return icons.get(event_type, "📌")
 
-def list_sessions(agent: str = None, limit: int = 20, status: str = None) -> list:
-    """List recent sessions."""
-    conn = get_conn()
-    
-    sql = "SELECT * FROM sessions WHERE 1=1"
-    params = []
-    
-    if agent:
-        sql += " AND agent = ?"
-        params.append(agent)
-    if status:
-        sql += " AND status = ?"
-        params.append(status)
-    
-    sql += " ORDER BY started_at DESC LIMIT ?"
-    params.append(limit)
-    
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
-    
-    return [{
-        "session_id": r[1], "agent": r[2], "started_at": r[3],
-        "ended_at": r[4], "total_steps": r[5], "total_duration_ms": r[6],
-        "total_tokens": (r[7] or 0) + (r[8] or 0),
-        "status": r[9], "summary": r[10]
-    } for r in rows]
-
-def get_agent_stats(agent: str, days: int = 7) -> dict:
-    """Get statistics for an agent."""
-    conn = get_conn()
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    
-    stats = conn.execute("""
-        SELECT
-            COUNT(DISTINCT session_id),
-            AVG(total_steps),
-            AVG(total_duration_ms),
-            SUM(total_tokens_input),
-            SUM(total_tokens_output),
-            AVG(total_duration_ms / NULLIF(total_steps, 0))
-        FROM sessions
-        WHERE agent = ? AND started_at >= ? AND status = 'completed'
-    """, (agent, cutoff)).fetchone()
-    
-    # Step type distribution
-    step_types = conn.execute("""
-        SELECT step_type, COUNT(*)
-        FROM traces t
-        JOIN sessions s ON s.session_id = t.session_id
-        WHERE s.agent = ? AND s.started_at >= ?
-        GROUP BY step_type
-    """, (agent, cutoff)).fetchall()
-    
-    # Error count
-    errors = conn.execute("""
-        SELECT COUNT(*) FROM traces t
-        JOIN sessions s ON s.session_id = t.session_id
-        WHERE s.agent = ? AND s.started_at >= ? AND t.step_type = 'error'
-    """, (agent, cutoff)).fetchone()[0]
-    
-    conn.close()
-    
-    return {
-        "agent": agent,
-        "period_days": days,
-        "total_sessions": stats[0] or 0,
-        "avg_steps_per_session": round(stats[1] or 0, 1),
-        "avg_duration_ms": round(stats[2] or 0, 0),
-        "total_tokens_input": stats[3] or 0,
-        "total_tokens_output": stats[4] or 0,
-        "avg_step_duration_ms": round(stats[5] or 0, 0),
-        "step_types": {st[0]: st[1] for st in step_types},
-        "errors": errors
+def event_color(event_type):
+    colors = {
+        "error": C.RED,
+        "warning": C.YELLOW,
+        "cost": C.GREEN,
+        "decision": C.CYAN,
+        "tool_call": C.BLUE,
+        "llm_call": C.MAGENTA,
     }
+    return colors.get(event_type, C.RESET)
 
-def find_slow_steps(agent: str = None, threshold_ms: float = 5000, limit: int = 20) -> list:
-    """Find slow steps across sessions."""
-    conn = get_conn()
-    
-    sql = """
-        SELECT t.session_id, t.step_number, t.step_type, t.tool_name,
-               t.duration_ms, t.model, t.timestamp, s.agent
-        FROM traces t
-        JOIN sessions s ON s.session_id = t.session_id
-        WHERE t.duration_ms >= ?
-    """
-    params = [threshold_ms]
-    
-    if agent:
-        sql += " AND s.agent = ?"
-        params.append(agent)
-    
-    sql += " ORDER BY t.duration_ms DESC LIMIT ?"
-    params.append(limit)
-    
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
-    
-    return [{
-        "session_id": r[0], "step": r[1], "type": r[2], "tool": r[3],
-        "duration_ms": r[4], "model": r[5], "timestamp": r[6], "agent": r[7]
-    } for r in rows]
-
-def find_error_patterns(agent: str = None, days: int = 7) -> list:
-    """Find common error patterns."""
-    conn = get_conn()
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    
-    sql = """
-        SELECT t.output_text, COUNT(*) as count, GROUP_CONCAT(DISTINCT t.tool_name)
-        FROM traces t
-        JOIN sessions s ON s.session_id = t.session_id
-        WHERE t.step_type = 'error' AND s.started_at >= ?
-    """
-    params = [cutoff]
-    
-    if agent:
-        sql += " AND s.agent = ?"
-        params.append(agent)
-    
-    sql += " GROUP BY t.output_text ORDER BY count DESC LIMIT 10"
-    
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
-    
-    return [{"error": r[0][:200], "count": r[1], "tools": r[2]} for r in rows]
-
-def compare_sessions(session_ids: list) -> dict:
-    """Compare multiple sessions side by side."""
-    sessions = []
-    for sid in session_ids:
-        s = get_session(sid)
-        if s:
-            sessions.append(s)
-    
-    if not sessions:
-        return {"error": "No sessions found"}
-    
-    comparison = {
-        "sessions": [],
-        "common_tools": set(),
-        "common_errors": set()
-    }
-    
-    all_tools = []
-    all_errors = []
-    
-    for s in sessions:
-        tools = set()
-        errors = set()
-        for step in s["steps"]:
-            if step["tool"]:
-                tools.add(step["tool"])
-            if step["type"] == "error":
-                errors.add(step["output"][:100] if step["output"] else "")
-        
-        all_tools.append(tools)
-        all_errors.append(errors)
-        
-        comparison["sessions"].append({
-            "session_id": s["session_id"],
-            "agent": s["agent"],
-            "steps": s["total_steps"],
-            "duration_ms": s["total_duration_ms"],
-            "tokens": s["total_tokens_input"] + s["total_tokens_output"],
-            "tools_used": list(tools),
-            "errors": len([e for e in errors if e])
-        })
-    
-    if all_tools:
-        comparison["common_tools"] = list(set.intersection(*all_tools)) if len(all_tools) > 1 else list(all_tools[0])
-    
-    return comparison
-
-# ── CLI Interface ──────────────────────────────────────────────────────────
+# ─── Commands ──────────────────────────────────────────────────────────────────
 
 def cmd_init(args):
-    """Initialize database."""
-    init_db()
-    print(f"✅ Trace database initialized at {DB_PATH}")
+    ensure_dirs()
+    session_id = str(uuid.uuid4())[:8]
+    session = {
+        "id": session_id,
+        "agent": args.agent or "unknown",
+        "started_at": now_iso(),
+        "ended_at": None,
+        "status": "active",
+        "metadata": {},
+        "events": [],
+        "stats": {
+            "total_events": 0,
+            "errors": 0,
+            "warnings": 0,
+            "tool_calls": 0,
+            "llm_calls": 0,
+            "total_cost": 0.0,
+            "total_tokens": 0,
+        },
+    }
+    if args.label:
+        session["metadata"]["label"] = args.label
+    if args.framework:
+        session["metadata"]["framework"] = args.framework
 
-def cmd_sessions(args):
-    """List sessions."""
-    sessions = list_sessions(agent=args.agent, limit=args.limit or 20)
-    
-    if not sessions:
-        print("No sessions found.")
-        return
-    
-    print(f"\n📋 Recent Sessions\n")
-    print(f"{'Session ID':<35} {'Agent':<12} {'Steps':<8} {'Duration':<12} {'Tokens':<10} {'Status'}")
-    print("─" * 90)
-    
-    for s in sessions:
-        duration = f"{s['total_duration_ms']/1000:.1f}s" if s['total_duration_ms'] else "?"
-        tokens = s.get('tokens', 0)
-        print(f"{s['session_id'][:33]:<35} {s['agent']:<12} {s['total_steps']:<8} {duration:<12} {tokens:<10} {s['status']}")
-    print()
+    save_session(SESSION_FILE, session)
+    print(colored(f"🚀 Agent trace session initialized", C.BOLD))
+    print(f"   Session ID : {colored(session_id, C.CYAN)}")
+    print(f"   Agent      : {colored(session['agent'], C.YELLOW)}")
+    if args.framework:
+        print(f"   Framework  : {colored(args.framework, C.GREEN)}")
+    print(f"   Started    : {session['started_at']}")
+    print(f"   Storage    : {TRACE_DIR}")
+
+def cmd_log(args):
+    ensure_dirs()
+    session = load_session(SESSION_FILE)
+    if not session:
+        print(colored("❌ No active session. Run 'agent-trace init' first.", C.RED))
+        sys.exit(1)
+
+    event = {
+        "id": str(uuid.uuid4())[:6],
+        "timestamp": now_iso(),
+        "type": args.event_type,
+        "agent": args.agent or session.get("agent", "unknown"),
+        "message": args.message,
+        "metadata": {},
+    }
+
+    if args.cost:
+        event["metadata"]["cost"] = args.cost
+        session["stats"]["total_cost"] += args.cost
+    if args.tokens:
+        event["metadata"]["tokens"] = args.tokens
+        session["stats"]["total_tokens"] += args.tokens
+    if args.tool:
+        event["metadata"]["tool"] = args.tool
+    if args.duration:
+        event["metadata"]["duration_ms"] = args.duration
+    if args.metadata:
+        try:
+            event["metadata"].update(json.loads(args.metadata))
+        except json.JSONDecodeError:
+            print(colored("⚠️ Invalid JSON metadata, skipping", C.YELLOW))
+
+    session["events"].append(event)
+    session["stats"]["total_events"] += 1
+
+    # Update counters
+    if args.event_type == "error":
+        session["stats"]["errors"] += 1
+    elif args.event_type == "warning":
+        session["stats"]["warnings"] += 1
+    elif args.event_type == "tool_call":
+        session["stats"]["tool_calls"] += 1
+    elif args.event_type == "llm_call":
+        session["stats"]["llm_calls"] += 1
+
+    save_session(SESSION_FILE, session)
+
+    icon = event_icon(args.event_type)
+    color = event_color(args.event_type)
+    ts = datetime.fromisoformat(event["timestamp"]).strftime("%H:%M:%S")
+    meta_str = ""
+    if args.cost:
+        meta_str += f" {colored(f'${args.cost:.4f}', C.GREEN)}"
+    if args.tokens:
+        meta_str += f" {colored(f'{args.tokens} tokens', C.YELLOW)}"
+    print(f"  {colored(ts, C.GRAY)} {icon} {color}{args.event_type:12s}{C.RESET} │ {args.message}{meta_str}")
 
 def cmd_show(args):
-    """Show session details."""
-    session = get_session(args.session_id)
-    
+    ensure_dirs()
+    session = load_session(SESSION_FILE)
     if not session:
-        print(f"❌ Session not found: {args.session_id}")
-        return
-    
-    print(f"\n🔍 Session: {session['session_id']}")
-    print(f"   Agent: {session['agent']} | Status: {session['status']}")
-    print(f"   Duration: {session['total_duration_ms']/1000:.1f}s | Steps: {session['total_steps']}")
-    print(f"   Tokens: {session['total_tokens_input'] + session['total_tokens_output']:,}")
-    if session['summary']:
-        print(f"   Summary: {session['summary']}")
+        print(colored("❌ No active session found.", C.RED))
+        sys.exit(1)
+
     print()
-    
-    for step in session['steps']:
-        icon = {"llm_call": "🤖", "tool_call": "🔧", "decision": "💡", "error": "❌"}.get(step['type'], "➡️")
-        print(f"  {icon} Step {step['step']}: {step['type']}", end="")
-        if step['tool']:
-            print(f" ({step['tool']})", end="")
-        if step['duration_ms']:
-            print(f" [{step['duration_ms']:.0f}ms]", end="")
+    print(colored("╔══════════════════════════════════════════════════════════╗", C.CYAN))
+    print(colored("║              🔍 AGENT TRACE — SESSION VIEW              ║", C.CYAN))
+    print(colored("╚══════════════════════════════════════════════════════════╝", C.CYAN))
+    print()
+    print(f"  Session  : {colored(session['id'], C.CYAN)}")
+    print(f"  Agent    : {colored(session['agent'], C.YELLOW)}")
+    print(f"  Status   : {colored(session['status'], C.GREEN if session['status'] == 'active' else C.RED)}")
+    print(f"  Started  : {session['started_at']}")
+    if session.get("ended_at"):
+        print(f"  Ended    : {session['ended_at']}")
+    print(f"  Duration : {colored(duration_str(session['started_at'], session.get('ended_at') or now_iso()), C.MAGENTA)}")
+    print()
+
+    if not session["events"]:
+        print(colored("  (no events recorded yet)", C.DIM))
         print()
-        
-        if step['reasoning'] and args.verbose:
-            print(f"     Reasoning: {step['reasoning'][:150]}")
-        if step['output'] and args.verbose:
-            out = step['output'][:200] + "..." if len(step['output']) > 200 else step['output']
-            print(f"     Output: {out}")
-    
-    print()
-
-def cmd_stats(args):
-    """Show agent statistics."""
-    stats = get_agent_stats(args.agent, days=args.days or 7)
-    
-    print(f"\n📊 Agent Stats: {stats['agent']} (last {stats['period_days']} days)\n")
-    print(f"Sessions:           {stats['total_sessions']}")
-    print(f"Avg Steps/Session:  {stats['avg_steps_per_session']}")
-    print(f"Avg Duration:       {stats['avg_duration_ms']/1000:.1f}s")
-    print(f"Avg Step Duration:  {stats['avg_step_duration_ms']:.0f}ms")
-    print(f"Total Tokens:       {stats['total_tokens_input'] + stats['total_tokens_output']:,}")
-    print(f"Errors:             {stats['errors']}")
-    
-    if stats['step_types']:
-        print(f"\nStep Types:")
-        for st, count in sorted(stats['step_types'].items(), key=lambda x: x[1], reverse=True):
-            print(f"  {st}: {count}")
-    print()
-
-def cmd_slow(args):
-    """Find slow steps."""
-    steps = find_slow_steps(agent=args.agent, threshold_ms=args.threshold or 5000)
-    
-    if not steps:
-        print("No slow steps found.")
         return
-    
-    print(f"\n🐌 Slow Steps (>{args.threshold or 5000}ms)\n")
-    for s in steps:
-        print(f"  {s['session_id'][:20]}... Step {s['step']}: {s['type']} ({s['tool'] or 'N/A'}) — {s['duration_ms']:.0f}ms")
+
+    print(colored("  ── Events ──────────────────────────────────────────────", C.DIM))
     print()
 
-def cmd_errors(args):
-    """Find error patterns."""
-    errors = find_error_patterns(agent=args.agent, days=args.days or 7)
-    
-    if not errors:
-        print("No errors found.")
-        return
-    
-    print(f"\n❌ Error Patterns\n")
-    for e in errors:
-        print(f"  ({e['count']}x) {e['error'][:100]}")
-        if e['tools']:
-            print(f"       Tools: {e['tools']}")
+    for ev in session["events"]:
+        icon = event_icon(ev["type"])
+        color = event_color(ev["type"])
+        ts = datetime.fromisoformat(ev["timestamp"]).strftime("%H:%M:%S.%f")[:-3]
+        meta_parts = []
+        if "cost" in ev.get("metadata", {}):
+            meta_parts.append(colored(f"${ev['metadata']['cost']:.4f}", C.GREEN))
+        if "tokens" in ev.get("metadata", {}):
+            meta_parts.append(colored(f"{ev['metadata']['tokens']}t", C.YELLOW))
+        if "tool" in ev.get("metadata", {}):
+            meta_parts.append(colored(f"[{ev['metadata']['tool']}]", C.BLUE))
+        if "duration_ms" in ev.get("metadata", {}):
+            meta_parts.append(colored(f"{ev['metadata']['duration_ms']}ms", C.MAGENTA))
+        meta_str = " ".join(meta_parts)
+        if meta_str:
+            meta_str = " " + meta_str
+
+        print(f"  {colored(ts, C.GRAY)} {icon} {color}{ev['type']:12s}{C.RESET} │ {ev['message']}{meta_str}")
+
     print()
 
-def cmd_compare(args):
-    """Compare sessions."""
-    comparison = compare_sessions(args.session_ids)
-    
-    if "error" in comparison:
-        print(f"❌ {comparison['error']}")
-        return
-    
-    print(f"\n📊 Session Comparison\n")
-    for s in comparison["sessions"]:
-        print(f"  {s['session_id'][:25]}...")
-        print(f"    Agent: {s['agent']} | Steps: {s['steps']} | Duration: {s['duration_ms']/1000:.1f}s")
-        print(f"    Tokens: {s['tokens']:,} | Errors: {s['errors']}")
-        print(f"    Tools: {', '.join(s['tools_used'][:5])}")
+def cmd_summary(args):
+    ensure_dirs()
+    session = load_session(SESSION_FILE)
+    if not session:
+        print(colored("❌ No active session found.", C.RED))
+        sys.exit(1)
+
+    stats = session["stats"]
+    duration = duration_str(session["started_at"], session.get("ended_at") or now_iso())
+
+    print()
+    print(colored("╔══════════════════════════════════════════════════════════╗", C.GREEN))
+    print(colored("║              📊 AGENT TRACE — SUMMARY                   ║", C.GREEN))
+    print(colored("╚══════════════════════════════════════════════════════════╝", C.GREEN))
+    print()
+    print(f"  Session ID   : {colored(session['id'], C.CYAN)}")
+    print(f"  Agent        : {colored(session['agent'], C.YELLOW)}")
+    print(f"  Duration     : {colored(duration, C.MAGENTA)}")
+    print()
+    print(colored("  ── Statistics ─────────────────────────────────────────", C.DIM))
+    print(f"  Total Events : {stats['total_events']}")
+    print(f"  Tool Calls   : {colored(str(stats['tool_calls']), C.BLUE)}")
+    print(f"  LLM Calls    : {colored(str(stats['llm_calls']), C.MAGENTA)}")
+    print(f"  Errors       : {colored(str(stats['errors']), C.RED if stats['errors'] > 0 else C.GREEN)}")
+    print(f"  Warnings     : {colored(str(stats['warnings']), C.YELLOW if stats['warnings'] > 0 else C.GREEN)}")
+    cost_val = f'${stats["total_cost"]:.4f}'
+    print(f"  Total Cost   : {colored(cost_val, C.GREEN)}")
+    print(f"  Total Tokens : {colored(str(stats['total_tokens']), C.YELLOW)}")
+    print()
+
+    # Event type breakdown
+    type_counts = defaultdict(int)
+    for ev in session["events"]:
+        type_counts[ev["type"]] += 1
+
+    if type_counts:
+        print(colored("  ── Event Breakdown ────────────────────────────────────", C.DIM))
+        for etype, count in sorted(type_counts.items(), key=lambda x: -x[1]):
+            icon = event_icon(etype)
+            bar = "█" * min(count, 40)
+            print(f"  {icon} {etype:14s} {colored(bar, C.CYAN)} {count}")
         print()
-    
-    if comparison["common_tools"]:
-        print(f"  Common tools: {', '.join(comparison['common_tools'])}")
+
+    # Error details
+    errors = [e for e in session["events"] if e["type"] == "error"]
+    if errors:
+        print(colored("  ── Errors ─────────────────────────────────────────────", C.RED))
+        for err in errors:
+            ts = datetime.fromisoformat(err["timestamp"]).strftime("%H:%M:%S")
+            print(f"  {colored(ts, C.GRAY)} ❌ {err['message']}")
+        print()
 
 def cmd_export(args):
-    """Export session data."""
-    session = get_session(args.session_id)
+    ensure_dirs()
+    session = load_session(SESSION_FILE)
     if not session:
-        print(f"❌ Session not found: {args.session_id}")
-        return
-    
-    output = json.dumps(session, indent=2, default=str)
-    
-    if args.output:
-        Path(args.output).write_text(output)
-        print(f"✅ Exported to {args.output}")
-    else:
-        print(output)
+        print(colored("❌ No active session found.", C.RED))
+        sys.exit(1)
 
-# ── Entry Point ────────────────────────────────────────────────────────────
+    fmt = args.format.lower()
+    out_path = args.output or f"agent-trace-{session['id']}.{fmt}"
+
+    if fmt == "json":
+        with open(out_path, "w") as f:
+            json.dump(session, f, indent=2, default=str)
+
+    elif fmt == "csv":
+        with open(out_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["timestamp", "type", "agent", "message", "cost", "tokens", "tool", "duration_ms"])
+            for ev in session["events"]:
+                meta = ev.get("metadata", {})
+                writer.writerow([
+                    ev["timestamp"], ev["type"], ev["agent"], ev["message"],
+                    meta.get("cost", ""), meta.get("tokens", ""),
+                    meta.get("tool", ""), meta.get("duration_ms", ""),
+                ])
+
+    elif fmt == "html":
+        html = _generate_html(session)
+        with open(out_path, "w") as f:
+            f.write(html)
+
+    else:
+        print(colored(f"❌ Unknown format: {fmt}. Use json, csv, or html.", C.RED))
+        sys.exit(1)
+
+    print(colored(f"✅ Exported to {out_path}", C.GREEN))
+
+def _generate_html(session):
+    events_html = ""
+    for ev in session["events"]:
+        icon = event_icon(ev["type"])
+        ts = datetime.fromisoformat(ev["timestamp"]).strftime("%H:%M:%S")
+        meta = ev.get("metadata", {})
+        meta_str = ", ".join(f"{k}={v}" for k, v in meta.items())
+        events_html += f"""
+        <tr>
+            <td>{ts}</td>
+            <td>{icon} {ev['type']}</td>
+            <td>{ev['agent']}</td>
+            <td>{ev['message']}</td>
+            <td>{meta_str}</td>
+        </tr>"""
+
+    stats = session["stats"]
+    return f"""<!DOCTYPE html>
+<html><head><title>Agent Trace — {session['id']}</title>
+<style>
+    body {{ font-family: monospace; background: #1a1a2e; color: #eee; padding: 2rem; }}
+    h1 {{ color: #00d4ff; }}
+    table {{ border-collapse: collapse; width: 100%; margin-top: 1rem; }}
+    th, td {{ padding: 0.5rem 1rem; text-align: left; border-bottom: 1px solid #333; }}
+    th {{ color: #00d4ff; }}
+    .stats {{ display: flex; gap: 2rem; margin: 1rem 0; }}
+    .stat {{ background: #16213e; padding: 1rem 1.5rem; border-radius: 8px; }}
+    .stat-value {{ font-size: 1.5rem; font-weight: bold; color: #00d4ff; }}
+</style></head>
+<body>
+<h1>🔍 Agent Trace Report</h1>
+<p>Session: {session['id']} | Agent: {session['agent']} | Status: {session['status']}</p>
+<div class="stats">
+    <div class="stat"><div class="stat-value">{stats['total_events']}</div>Events</div>
+    <div class="stat"><div class="stat-value">{stats['tool_calls']}</div>Tool Calls</div>
+    <div class="stat"><div class="stat-value">{stats['llm_calls']}</div>LLM Calls</div>
+    <div class="stat"><div class="stat-value" style="color:#ff6b6b">{stats['errors']}</div>Errors</div>
+    <div class="stat"><div class="stat-value" style="color:#51cf66">${stats['total_cost']:.4f}</div>Cost</div>
+    <div class="stat"><div class="stat-value" style="color:#ffd43b">{stats['total_tokens']}</div>Tokens</div>
+</div>
+<table>
+<tr><th>Time</th><th>Type</th><th>Agent</th><th>Message</th><th>Metadata</th></tr>
+{events_html}
+</table>
+</body></html>"""
+
+def cmd_sessions(args):
+    ensure_dirs()
+    sessions = []
+    for f in sorted(SESSIONS_DIR.iterdir(), reverse=True):
+        if f.suffix == ".json":
+            with open(f) as fp:
+                s = json.load(fp)
+            sessions.append(s)
+
+    # Also check current session
+    current = load_session(SESSION_FILE)
+    if current:
+        sessions.insert(0, current)
+
+    if not sessions:
+        print(colored("No sessions found.", C.DIM))
+        return
+
+    print()
+    print(colored("  📋 Agent Trace Sessions", C.BOLD))
+    print()
+    for s in sessions:
+        status_color = C.GREEN if s["status"] == "active" else C.GRAY
+        dur = duration_str(s["started_at"], s.get("ended_at") or now_iso())
+        err_str = ""
+        if s["stats"]["errors"] > 0:
+            err_str = colored(f" ({s['stats']['errors']} errors)", C.RED)
+        print(f"  {colored(s['id'], C.CYAN)}  {colored(s['agent'], C.YELLOW):20s}  {colored(s['status'], status_color):8s}  {dur:8s}  {s['stats']['total_events']} events{err_str}")
+    print()
+
+def cmd_end(args):
+    ensure_dirs()
+    session = load_session(SESSION_FILE)
+    if not session:
+        print(colored("❌ No active session.", C.RED))
+        sys.exit(1)
+
+    session["ended_at"] = now_iso()
+    session["status"] = "completed"
+
+    # Save to sessions archive
+    archive_path = SESSIONS_DIR / f"{session['id']}_{int(time.time())}.json"
+    save_session(archive_path, session)
+    save_session(SESSION_FILE, session)
+
+    print(colored(f"🏁 Session {session['id']} ended and archived.", C.GREEN))
+    print(f"   Archive: {archive_path}")
+
+def cmd_watch(args):
+    ensure_dirs()
+    print(colored("👁️  Watching agent activity... (Ctrl+C to stop)", C.CYAN))
+    print()
+    last_count = 0
+    try:
+        while True:
+            session = load_session(SESSION_FILE)
+            if session and len(session["events"]) > last_count:
+                new_events = session["events"][last_count:]
+                for ev in new_events:
+                    icon = event_icon(ev["type"])
+                    color = event_color(ev["type"])
+                    ts = datetime.fromisoformat(ev["timestamp"]).strftime("%H:%M:%S")
+                    print(f"  {colored(ts, C.GRAY)} {icon} {color}{ev['type']:12s}{C.RESET} │ {ev['message']}")
+                last_count = len(session["events"])
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print()
+        print(colored("Watch stopped.", C.DIM))
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    import argparse
-    
     parser = argparse.ArgumentParser(
-        description="agent-trace — Trace and debug AI agent decisions",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        prog="agent-trace",
+        description="🔍 Lightweight observability CLI for AI agents",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    
-    subparsers = parser.add_subparsers(dest="command")
-    
-    subparsers.add_parser("init", help="Initialize database")
-    
-    sessions_parser = subparsers.add_parser("sessions", help="List sessions")
-    sessions_parser.add_argument("--agent", help="Filter by agent")
-    sessions_parser.add_argument("--limit", type=int, default=20)
-    
-    show_parser = subparsers.add_parser("show", help="Show session details")
-    show_parser.add_argument("session_id", help="Session ID")
-    show_parser.add_argument("--verbose", "-v", action="store_true")
-    
-    stats_parser = subparsers.add_parser("stats", help="Show agent statistics")
-    stats_parser.add_argument("agent", help="Agent name")
-    stats_parser.add_argument("--days", type=int, default=7)
-    
-    slow_parser = subparsers.add_parser("slow", help="Find slow steps")
-    slow_parser.add_argument("--agent", help="Filter by agent")
-    slow_parser.add_argument("--threshold", type=float, default=5000)
-    
-    errors_parser = subparsers.add_parser("errors", help="Find error patterns")
-    errors_parser.add_argument("--agent", help="Filter by agent")
-    errors_parser.add_argument("--days", type=int, default=7)
-    
-    compare_parser = subparsers.add_parser("compare", help="Compare sessions")
-    compare_parser.add_argument("session_ids", nargs="+", help="Session IDs")
-    
-    export_parser = subparsers.add_parser("export", help="Export session")
-    export_parser.add_argument("session_id", help="Session ID")
-    export_parser.add_argument("--output", help="Output file")
-    
+    sub = parser.add_subparsers(dest="command")
+
+    # init
+    p_init = sub.add_parser("init", help="Initialize a new tracing session")
+    p_init.add_argument("--agent", "-a", help="Agent name")
+    p_init.add_argument("--framework", "-f", help="Agent framework (e.g., hermes, langchain, crewai)")
+    p_init.add_argument("--label", "-l", help="Session label")
+
+    # log
+    p_log = sub.add_parser("log", help="Log an agent event")
+    p_log.add_argument("event_type", help="Event type (decision, tool_call, error, llm_call, etc.)")
+    p_log.add_argument("message", help="Event message")
+    p_log.add_argument("--agent", "-a", help="Agent name (overrides session default)")
+    p_log.add_argument("--cost", "-c", type=float, help="Cost in USD")
+    p_log.add_argument("--tokens", "-t", type=int, help="Token count")
+    p_log.add_argument("--tool", help="Tool name (for tool_call events)")
+    p_log.add_argument("--duration", "-d", type=int, help="Duration in milliseconds")
+    p_log.add_argument("--metadata", "-m", help="Additional JSON metadata")
+
+    # show
+    sub.add_parser("show", help="Show current session trace")
+
+    # summary
+    sub.add_parser("summary", help="Show session summary")
+
+    # export
+    p_export = sub.add_parser("export", help="Export trace (json, csv, html)")
+    p_export.add_argument("format", choices=["json", "csv", "html"], help="Export format")
+    p_export.add_argument("--output", "-o", help="Output file path")
+
+    # sessions
+    sub.add_parser("sessions", help="List all sessions")
+
+    # end
+    sub.add_parser("end", help="End current session and archive")
+
+    # watch
+    sub.add_parser("watch", help="Watch live agent activity")
+
     args = parser.parse_args()
-    
+
     if not args.command:
         parser.print_help()
-        return
-    
+        sys.exit(0)
+
     commands = {
-        "init": cmd_init, "sessions": cmd_sessions, "show": cmd_show,
-        "stats": cmd_stats, "slow": cmd_slow, "errors": cmd_errors,
-        "compare": cmd_compare, "export": cmd_export,
+        "init": cmd_init,
+        "log": cmd_log,
+        "show": cmd_show,
+        "summary": cmd_summary,
+        "export": cmd_export,
+        "sessions": cmd_sessions,
+        "end": cmd_end,
+        "watch": cmd_watch,
     }
-    
+
     commands[args.command](args)
 
 if __name__ == "__main__":
